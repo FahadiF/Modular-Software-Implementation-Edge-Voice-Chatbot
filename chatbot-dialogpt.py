@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+Voice chatbot with:
+1. **Local Whisper STT** (openai/whisper)
+2. **High‑quality TTS** using **Coqui TTS** (tts library)
+
+Versions:
+NVidia driver 535.274.02 CUDA Version: 12.2
+numpy                      2.2.5
+nvidia-cublas-cu12         12.8.4.1
+nvidia-cuda-cupti-cu12     12.8.90
+nvidia-cuda-nvrtc-cu12     12.8.93
+nvidia-cuda-runtime-cu12   12.8.90
+nvidia-cudnn-cu12          9.10.2.21
+nvidia-cufft-cu12          11.3.3.83
+nvidia-cufile-cu12         1.13.1.3
+nvidia-curand-cu12         10.3.9.90
+nvidia-cusolver-cu12       11.7.3.90
+nvidia-cusparse-cu12       12.5.8.93
+nvidia-cusparselt-cu12     0.7.1
+nvidia-nccl-cu12           2.27.3
+nvidia-nvjitlink-cu12      12.8.93
+nvidia-nvtx-cu12           12.8.90
+Python 3.12.9
+Torch 2.8.0
+torchvision 0.23.0
+torchaudio 2.8.0
+coqui-tts2 0.27.2
+whisper release 20250625
+transformers 4.55.5
+
+
+
+
+
+
+
+Install:
+    pip install git+https://github.com/openai/whisper.git
+    pip install TTS transformers torch sounddevice numpy
+
+If using GPU:
+    pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+Run:
+    python voice_chatbot.py
+"""
+
+import torch
+import torchaudio
+import queue
+import sounddevice as sd
+import numpy as np
+from TTS.api import TTS
+import whisper
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+print(torch.version.__version__)
+print(torchaudio.version.__version__)
+
+# ---------------------------- Config ----------------------------
+STT_MODEL = "base"          # Whisper model size
+TTS_MODEL = "tts_models/multilingual/multi-dataset/your_tts"  # Coqui high‑quality
+LM_MODEL = "microsoft/DialoGPT-medium"
+SAMPLE_RATE = 16000
+MAX_HISTORY = 6
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ---------------------------- Load models ----------------------------
+print("Loading Whisper STT...")
+stt_model = whisper.load_model(STT_MODEL, device=DEVICE)
+
+print("Loading TTS model...")
+tts = TTS(TTS_MODEL).to(DEVICE)
+print(tts.speakers)
+
+print("Loading language model...")
+tokenizer = AutoTokenizer.from_pretrained(LM_MODEL)
+lm = AutoModelForCausalLM.from_pretrained(LM_MODEL).to(DEVICE)
+
+chat_history = []
+
+# ---------------------------- Audio Capture ----------------------------
+
+def record_audio(duration=5):
+    print("Listening...")
+    audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="float32")
+    sd.wait()
+    return audio.squeeze()
+
+
+def stt(audio_np):
+    print("Transcribing locally with Whisper...")
+    audio = whisper.pad_or_trim(audio_np)
+    mel = whisper.log_mel_spectrogram(audio).to(DEVICE)
+    result = stt_model.decode(mel)
+    text = result.text.strip()
+    print("You said:", text)
+    return text
+
+# ---------------------------- TTS ----------------------------
+
+def speak(text):
+    print(f"Bot: {text}")
+    wav = tts.tts(text, language="en", speaker="male-en-2")
+    sd.play(np.array(wav), samplerate=tts.synthesizer.output_sample_rate)
+    sd.wait()
+
+# ---------------------------- LM Response ----------------------------
+def generate_response(user_input):
+    chat_history.append(user_input)
+    if len(chat_history) > MAX_HISTORY:
+        chat_history[:] = chat_history[-MAX_HISTORY:]
+
+    joint = tokenizer.eos_token.join(chat_history) + tokenizer.eos_token
+    input_ids = tokenizer.encode(joint, return_tensors="pt").to(DEVICE)
+
+    output = lm.generate(
+        input_ids,
+        max_length=input_ids.shape[1] + 128,
+        do_sample=True,
+        top_k=50,
+        top_p=0.95,
+        temperature=0.7,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    generated = output[0][input_ids.shape[1]:]
+    response = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    chat_history.append(response)
+    return response
+
+# ---------------------------- Main Loop ----------------------------
+
+def main():
+    print("Voice chatbot ready — say 'quit' to exit.")
+    while True:
+        audio = record_audio(duration=5)
+        text = stt(audio)
+        if not text:
+            continue
+        if text.lower() in ["quit.", "exit.", "stop.", "quit!", "exit!", "stop!"]:
+            speak("Goodbye!")
+            break
+
+        reply = generate_response(text)
+        speak(reply)
+
+
+if __name__ == "__main__":
+    main()

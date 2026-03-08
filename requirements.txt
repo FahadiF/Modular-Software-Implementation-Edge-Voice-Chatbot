@@ -1,0 +1,11 @@
+torch==2.8.0
+torchaudio==2.8.0
+transformers==4.55.4
+openai-whisper==20250625
+TTS==0.27.2
+sounddevice==0.5.3
+numpy==2.2.5
+autoawq==0.2.9
+accelerate==1.12.0
+einops==0.8.1
+tiktoken==0.12.0
