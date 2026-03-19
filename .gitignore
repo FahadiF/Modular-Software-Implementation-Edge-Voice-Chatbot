@@ -1,0 +1,17 @@
+# Virtual Environments
+edge_env/
+venv/
+env/
+
+# Jupyter Lab Cache
+.ipynb_checkpoints/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS generated files
+.DS_Store
+Thumbs.db
