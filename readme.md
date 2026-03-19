@@ -53,7 +53,7 @@ python chatbot-moderate-qwen.py
 ```
 *Note: The first run will take several minutes to download the Whisper, Coqui, and Qwen models from Hugging Face to your local cache.*
 
-**To exit the application:** Wait for the terminal to print `Listening...` and simply say **"Quit"**, **"Stop"**, or **"Exit"** into the microphone.
+**To exit the application:** Wait for the terminal to print `Listening...` and simply say **"Quit"** or press **"Ctrl + C"** on keyboard to force exit.
 
 ---
 
