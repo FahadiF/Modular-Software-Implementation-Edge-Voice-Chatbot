@@ -63,6 +63,7 @@ SAMPLE_DURATION = 5.0      # seconds per listen. Increase for longer user uttera
 
 # ------------------------- LM Config ----------------------------
 #LM_MODEL = "microsoft/DialoGPT-medium"
+#LM_MODEL = "Qwen/Qwen2.5-3B-Instruct-AWQ" #for Linux Only
 LM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 MAX_HISTORY = 6
