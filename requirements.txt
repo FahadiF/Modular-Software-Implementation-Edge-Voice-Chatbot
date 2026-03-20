@@ -8,3 +8,4 @@ transformers==4.55.4
 sounddevice
 numpy
 accelerate
+silero-vad

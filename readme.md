@@ -2,13 +2,16 @@
 
 **Master's Thesis Project - University of Vaasa**
 
-Currently contains the baseline implementation files provided by Prof. Boutellier.
 This repository contains the implementation of a fully local, edge-deployed conversational AI pipeline. The system integrates Speech-to-Text (STT), a Large Language Model (LLM), and Text-to-Speech (TTS) to create a low-latency voice assistant capable of running on consumer-grade hardware (tested on an NVIDIA RTX 3060 6GB).
 
 ## Repository Contents
-* `chatbot-dialogpt.py` - Lightweight baseline implementation using DialoGPT.
-* `chatbot-moderate-qwen.py` - Advanced implementation utilizing Qwen 2.5 (1.5B/3B), Whisper STT, and Coqui TTS.
-* `requirements.txt` - Locked, cross-platform dependencies ensuring GPU acceleration.
+
+| Script | Phase | Description |
+|---|---|---|
+| `chatbot-dialogpt.py` | Legacy | Lightweight baseline using DialoGPT |
+| `chatbot-moderate-qwen.py` | **Phase 1** | Baseline sequential pipeline: hardcoded 5-second recording window. Whisper STT + Qwen 2.5 (1.5B) + Coqui TTS |
+| `chatbot-vad-qwen.py` | **Phase 2** | Adaptive listening with `silero-vad`: recording stops dynamically after ~640 ms of silence. Adds per-turn timing logs for thesis runtime analysis |
+| `requirements.txt` | — | Locked, cross-platform dependencies with GPU acceleration |
 
 ---
 
@@ -22,7 +25,6 @@ This repository contains the implementation of a fully local, edge-deployed conv
 ## Installation & Setup
 
 **1. Create and Activate a Virtual Environment**
-To prevent dependency conflicts, it is highly recommended to use an isolated Python virtual environment.
 ```bash
 python -m venv edge_env
 
@@ -33,34 +35,61 @@ source edge_env/bin/activate
 ```
 
 **2. Install Dependencies**
-Install the exact required packages. The `requirements.txt` is pre-configured to fetch the GPU-accelerated version of PyTorch automatically.
 ```bash
 pip install -r requirements.txt
 ```
 
-**3. The Windows AWQ Bypass (Windows Users Only)**
-The baseline script relies on `autoawq` to run a quantized 3B Qwen model. However, `autoawq` requires `triton`, which is strictly Linux-only. If you are running this on Windows, you must use the standard PyTorch 1.5B model instead:
-* Open `chatbot-moderate-qwen.py`.
-* Change Line 46 to: `LM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"`
+**3. Windows Note (AWQ Bypass)**
+The `autoawq` library requires `triton`, which is Linux-only. On Windows, use the standard 1.5B model:
+* In either script, confirm: `LM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"`
 
 ---
 
 ## Running the Chatbot
-Ensure your virtual environment is active and your microphone is unmuted, then run:
 
+Ensure your virtual environment is active and microphone is unmuted.
+
+**Phase 1 — Baseline (fixed 5-second window):**
 ```bash
 python chatbot-moderate-qwen.py
 ```
-*Note: The first run will take several minutes to download the Whisper, Coqui, and Qwen models from Hugging Face to your local cache.*
 
-**To exit the application:** Wait for the terminal to print `Listening...` and simply say **"Quit"** or press **"Ctrl + C"** on keyboard to force exit.
+**Phase 2 — Adaptive Listening (VAD):**
+```bash
+python chatbot-vad-qwen.py
+```
+
+*Note: The first run will download Whisper, Coqui, and Qwen models from Hugging Face (~several minutes).*
+
+**To exit:** Say **"Quit"**, **"Exit"**, or **"Stop"** — or press **Ctrl + C**.
 
 ---
 
-## Current Status & Next Steps
+## Project Phases & Status
 
-**Current Status (Phase 1 Complete):** The baseline sequential pipeline (Whisper STT -> Qwen 1.5B LLM -> Coqui TTS) is successfully running locally on Windows 11 with full RTX 3060 hardware acceleration.
+| Phase | Script | Description | Status |
+|---|---|---|---|
+| Phase 1 | `chatbot-moderate-qwen.py` | Baseline sequential pipeline | ✅ Complete |
+| Phase 2 | `chatbot-vad-qwen.py` | Adaptive listening with `silero-vad` | ✅ Complete |
+| Phase 3 | *(TBD)* | Multithreaded concurrent pipeline | 🔲 Planned |
 
-**Identified Issue:** The current script utilizes a hardcoded 5-second recording loop (`sd.rec(duration=5)`). This forces the Whisper model to transcribe ambient room silence when the user is not actively speaking, resulting in severe AI hallucinations (e.g., transcribing repeating numbers or gibberish). This pollutes the LLM's context window and eventually causes Out-of-Memory (OOM) crashes.
+### Phase 2 — Technical Notes
 
-**Phase 2 Objective (Adaptive Listening):** Implement a lightweight Voice Activity Detection (VAD) module (e.g., WebRTC VAD or Silero) to replace the hardcoded recording window. The system will be refactored to only capture and pass audio to Whisper when human speech is actively detected, terminating the recording dynamically after a brief period of silence.
+**VAD Library:** `silero-vad` (neural, ~1.5 MB model, runs on CPU — preserves VRAM for Whisper + LLM).
+
+**Key Parameters** (tunable at the top of `chatbot-vad-qwen.py`):
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `VAD_THRESHOLD` | `0.5` | Speech probability cutoff (0–1) |
+| `SILENCE_CHUNKS` | `20` | ~640 ms of silence triggers stop |
+| `MAX_RECORD_SECS` | `15` | Hard recording timeout (safety net) |
+| `CHUNK_SIZE` | `512` | Samples per VAD inference call (~32 ms) |
+
+**STT Improvement:** Phase 2 uses `whisper.transcribe()` instead of the low-level `decode()` call from Phase 1. This correctly handles variable-length audio and eliminates hallucinations caused by padding silence.
+
+**Timing Logs:** Each turn prints:
+```
+[Timing] Record: Xs | STT: Xs | LM: Xs | TTS: Xs | Total: Xs
+```
+These logs are used directly for thesis runtime analysis and comparison across phases.
