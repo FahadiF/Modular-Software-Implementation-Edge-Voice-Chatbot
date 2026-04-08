@@ -11,7 +11,7 @@ This repository contains the implementation of a fully local, edge-deployed conv
 | `chatbot-dialogpt.py` | Legacy | Lightweight baseline using DialoGPT |
 | `chatbot-moderate-qwen.py` | **Phase 1** | Baseline sequential pipeline: hardcoded 5-second recording window. Whisper STT + Qwen 2.5 (1.5B) + Coqui TTS |
 | `chatbot-vad-qwen.py` | **Phase 2** | Adaptive listening with `silero-vad`: recording stops dynamically after ~640 ms of silence. Adds per-turn timing logs for thesis runtime analysis |
-| `chatbot-threaded-qwen.py` | **Phase 3** | Concurrent multithreaded pipeline: VAD capture, Whisper + Qwen inference, and Coqui TTS run in parallel threads. Adds keyboard interrupt and echo suppression |
+| `chatbot-threaded-qwen.py` | **Phase 3** | Concurrent multithreaded pipeline: VAD capture, Whisper + Qwen inference, and Coqui TTS run in parallel threads. Keyboard interrupt, echo suppression, and optional headset voice barge-in |
 | `requirements.txt` | — | Locked, cross-platform dependencies with GPU acceleration |
 
 ---
@@ -76,6 +76,8 @@ python chatbot-threaded-qwen.py
 | Quit immediately | Press **q** |
 | Emergency exit | **Ctrl + C** |
 
+*Keyboard controls are cross-platform: `msvcrt` on Windows; `termios` + `select` on Linux/macOS. No additional pip package is needed on either OS.*
+
 ---
 
 ## Project Phases & Status
@@ -126,14 +128,35 @@ Thread D (Keyboard)  — Space: stop speech | q: quit
 
 | Parameter | Default | Effect |
 |---|---|---|
+| `STT_MODEL` | `"base"` | Whisper model size: `tiny` / `base` / `small` / `medium` / `large` |
 | `VAD_THRESHOLD` | `0.5` | Speech probability cutoff (0–1) |
 | `SILENCE_CHUNKS` | `30` | ~960 ms of silence triggers stop |
 | `MIN_SPEECH_CHUNKS` | `12` | ~384 ms minimum to pass noise gate |
 | `MAX_RECORD_SECS` | `15` | Hard recording timeout (safety net) |
+| `HEADSET_MODE` | `False` | Enable voice barge-in when using a headset (see below) |
+| `BARGE_IN_CHUNKS` | `20` | ~640 ms of sustained speech required to trigger barge-in |
 
-**Echo Suppression:** The microphone is muted while the bot is speaking. Without hardware Acoustic Echo Cancellation (AEC), the VAD cannot distinguish TTS output from a real user utterance, so capture is suppressed during playback. The Space key provides a keyboard-based interrupt instead.
+**Echo Suppression & HEADSET_MODE:**
 
-**Keyboard Interrupt (Thread D):** Uses Windows built-in `msvcrt` — no additional pip package required. Polls every 50 ms with no perceptible latency.
+Without hardware Acoustic Echo Cancellation (AEC), the microphone on a laptop picks up the bot's own TTS output through the speakers, causing the VAD to fire on the bot's voice and interrupt it mid-sentence.
+
+The `HEADSET_MODE` constant controls how this is handled:
+
+| `HEADSET_MODE` | Behaviour |
+|---|---|
+| `False` *(default)* | Mic capture is muted during playback. The bot never interrupts itself. Use Space to stop speech manually. |
+| `True` | Mic stays open during playback. After `BARGE_IN_CHUNKS` (~640 ms) of sustained user speech, the bot's current utterance is cut off and Thread A immediately starts capturing the user's new sentence. Use this only with headphones or an external mic placed away from the speakers. |
+
+**STT Accuracy:** The default `STT_MODEL = "base"` is optimised for speed within the 6 GB VRAM budget. Switching to `"small"` (~+320 MB VRAM) or `"medium"` (~+1.5 GB VRAM) noticeably improves transcription accuracy at the cost of slightly higher latency.
+
+**LLM Output Length:** The system prompt instructs the model to answer in one to two short sentences, and `max_new_tokens` is capped at 150. This combination ensures replies finish naturally without mid-sentence clipping while keeping spoken output concise.
+
+**Keyboard Interrupt (Thread D):** Cross-platform, no pip install required. Polls every 50 ms.
+
+| OS | Library used |
+|---|---|
+| Windows | `msvcrt` (built-in) |
+| Linux / macOS | `termios` + `select` (built-in) |
 
 **Timing Logs:** Each thread prints independently:
 ```

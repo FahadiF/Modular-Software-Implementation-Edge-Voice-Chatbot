@@ -2,28 +2,22 @@
 """
 Voice chatbot — Phase 3: Concurrent Multithreaded Pipeline
 
-Architecture: Four independent threads communicating via thread-safe Queues.
+Architecture: Four threads communicating via thread-safe Queues.
 
   Thread A (Capture)  →[audio_queue]→  Thread B (Inference)  →[tts_queue]→  Thread C (Output)
      VAD + mic                           Whisper + Qwen                        Coqui + playback
   Thread D (Keyboard)
      Space = stop speech  |  q = quit
 
-Key improvements vs Phase 2:
+Changes vs Phase 2 (chatbot-vad-qwen.py):
   - Thread A resumes listening immediately after dropping audio into the queue.
-    The user can start the next utterance while Thread B is still running Whisper.
-  - Backpressure via maxsize=1 queues: upstream blocks rather than accumulating
-    stale utterances when downstream is busy.
-  - Echo suppression: mic capture is muted while the bot is speaking to prevent
-    the VAD from picking up TTS output through the microphone.
-  - Keyboard interrupt (Thread D): Space stops current speech; q exits cleanly.
-    Uses Windows built-in msvcrt — no extra pip package needed.
-  - Clean shutdown via threading.Event (quit_event) + cascading None sentinels.
+  - Backpressure via maxsize=1 queues prevents stale utterance pile-up.
+  - Mic capture muted during playback to suppress echo (no hardware AEC).
+  - Keyboard interrupt: Space stops current speech; q exits cleanly.
+  - Cross-platform: msvcrt on Windows, termios+select on Linux/macOS.
   - Per-thread timing logs for thesis runtime analysis.
 
 Hardware target: Nvidia RTX 3060 (6 GB VRAM), Windows 11 / Linux.
-Steady-state VRAM:  Whisper base ~145 MB  |  Qwen 1.5B fp16 ~3.0 GB  |  Coqui ~150 MB
-Total GPU:          ~3.3 GB — safely within the 6 GB budget.
 
 Install (run once inside edge_env):
     pip install silero-vad
@@ -44,8 +38,8 @@ Versions tested:
     transformers 4.55.5
 """
 
+import os
 import re
-import msvcrt
 import threading
 import queue
 import time
@@ -59,6 +53,41 @@ import whisper
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from silero_vad import load_silero_vad
 
+# ─────────────────────  Cross-platform Keyboard ────────────────
+
+if os.name == "nt":
+    import msvcrt
+
+    def _kbhit() -> bool:
+        return msvcrt.kbhit()
+
+    def _getch() -> str:
+        return msvcrt.getwch()
+else:
+    import sys
+    import tty
+    import termios
+    import select
+
+    _orig_settings = None
+
+    def _tty_raw_on():
+        global _orig_settings
+        _orig_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+    def _tty_raw_off():
+        if _orig_settings is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _orig_settings)
+
+    def _kbhit() -> bool:
+        dr, _, _ = select.select([sys.stdin], [], [], 0)
+        return bool(dr)
+
+    def _getch() -> str:
+        return sys.stdin.read(1)
+
+
 print(f"Torch: {torch.__version__}  |  torchaudio: {torchaudio.__version__}")
 
 # ─────────────────────  Audio Config ───────────────────────────
@@ -70,17 +99,18 @@ CHANNELS    = 1
 
 # ─────────────────────  VAD Parameters ──────────────────────────
 # Silero-vad requires chunk sizes of exactly 256 or 512 samples at 16 kHz.
-CHUNK_SIZE    = 512         # ~32 ms per chunk at 16 kHz
-VAD_THRESHOLD = 0.5         # speech probability threshold (0–1)
-# How many consecutive silent chunks before we stop recording.
-# 30 chunks × 32 ms = ~960 ms of silence — slightly longer than Phase 2
-# to avoid cutting off natural mid-sentence pauses.
-SILENCE_CHUNKS = 30
-# Safety net: never record longer than this even if VAD keeps firing.
-MAX_RECORD_SECS = 15
-# Minimum VAD-confirmed speech chunks before forwarding to Whisper.
-# 12 chunks × 32 ms = ~384 ms — filters out fan-noise / HVAC blips.
+CHUNK_SIZE       = 512      # ~32 ms per chunk at 16 kHz
+VAD_THRESHOLD    = 0.5      # speech probability threshold (0–1)
+# 30 chunks × 32 ms = ~960 ms of silence → natural mid-sentence pause tolerance.
+SILENCE_CHUNKS   = 30
+MAX_RECORD_SECS  = 15      # safety net: hard recording timeout
+# 12 chunks × 32 ms = ~384 ms — noise gate for fan/HVAC blips.
 MIN_SPEECH_CHUNKS = 12
+# Set True only when using a headset — enables voice barge-in.
+# On laptop speakers the bot hears its own TTS, so keep this False.
+HEADSET_MODE    = True
+# 20 chunks × 32 ms = ~640 ms of user speech required to trigger barge-in.
+BARGE_IN_CHUNKS = 20
 
 # ─────────────────────  LM Config ───────────────────────────
 
@@ -88,41 +118,28 @@ LM_MODEL    = "Qwen/Qwen2.5-1.5B-Instruct"
 MAX_HISTORY = 6
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
+SYSTEM_PROMPT = (
+    "You are a helpful voice assistant. "
+    "Answer conversationally in one to two short sentences. "
+    "Be concise and direct."
+)
+
 GEN_KWARGS = {
     "repetition_penalty": 1.05,
     "do_sample":          True,
     "temperature":        0.3,
-    "max_new_tokens":     45,
+    "max_new_tokens":     150,  # room to finish sentences (system prompt keeps output short)
     "top_p":              0.7,
 }
 
 # ─────────────────────  Queues & Shared Events ──────────────────
-#
-#  audio_queue  (Thread A → Thread B)
-#    Payload : np.ndarray, float32, 1-D
-#    maxsize=1: Thread A blocks if Thread B is still processing.
-#               Prevents piling up stale utterances.
-#
-#  tts_queue   (Thread B → Thread C)
-#    Payload : str (LLM reply text)
-#    maxsize=1: Thread B blocks if Thread C is still speaking.
-#               Natural turn-taking with no explicit lock.
-#
-#  Sentinel : None on a queue signals the consumer to exit cleanly.
 
 audio_queue: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=1)
 tts_queue:   "queue.Queue[Optional[str]]"        = queue.Queue(maxsize=1)
 
-# Set by quit command (Thread B/D) or Ctrl+C (main) to stop all threads.
-quit_event = threading.Event()
-
-# Set by Thread C while the bot is speaking. Thread A discards VAD triggers
-# while this is active so TTS output never re-enters the pipeline.
-playback_active = threading.Event()
-
-# Set by Thread D (Space key) to cut off the current bot utterance mid-speech.
-# Thread C checks this in its playback loop and clears it after stopping.
-stop_speaking_event = threading.Event()
+quit_event         = threading.Event()   # set by Thread B/D or Ctrl+C
+playback_active    = threading.Event()   # set by Thread C while speaking
+stop_speaking_event = threading.Event()  # set by Thread D (Space key)
 
 
 # ─────────────────────  Load Models ─────────────────────────────
@@ -167,19 +184,15 @@ def capture_thread(vad_model) -> None:
 
         print("[Thread A] Listening...")
 
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=CHUNK_SIZE,
-        ) as stream:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                            dtype="float32", blocksize=CHUNK_SIZE) as stream:
             for _ in range(max_chunks):
 
                 if quit_event.is_set():
                     break
 
                 chunk, _ = stream.read(CHUNK_SIZE)
-                chunk_1d = chunk.squeeze()   # shape (CHUNK_SIZE,) float32
+                chunk_1d = chunk.squeeze()
 
                 # silero-vad expects a 1-D float32 tensor
                 chunk_tensor = torch.from_numpy(chunk_1d)
@@ -189,31 +202,34 @@ def capture_thread(vad_model) -> None:
                 is_speech = speech_prob >= VAD_THRESHOLD
 
                 if is_speech:
-                    # Mute during bot playback — without AEC we cannot
-                    # separate TTS output from a real user utterance.
-                    if playback_active.is_set():
+                    if playback_active.is_set() and not HEADSET_MODE:
+                        # Mute — without AEC we cannot separate TTS from user speech
                         recorded_chunks.clear()
-                        speech_detected    = False
+                        speech_detected = False
                         speech_chunk_count = 0
-                        silent_count       = 0
+                        silent_count = 0
                         continue
                     speech_detected    = True
                     speech_chunk_count += 1
                     silent_count       = 0
                     recorded_chunks.append(chunk_1d)
-                elif speech_detected:
-                    # Only count silence after we've heard at least one speech chunk
-                    if playback_active.is_set():
+                    if HEADSET_MODE and playback_active.is_set() and speech_chunk_count >= BARGE_IN_CHUNKS:
+                        print("\n[Thread A] Voice barge-in detected!")
+                        stop_speaking_event.set()
                         recorded_chunks.clear()
-                        speech_detected    = False
                         speech_chunk_count = 0
-                        silent_count       = 0
+                elif speech_detected:
+                    if playback_active.is_set() and not HEADSET_MODE:
+                        recorded_chunks.clear()
+                        speech_detected = False
+                        speech_chunk_count = 0
+                        silent_count = 0
                         continue
                     silent_count += 1
-                    recorded_chunks.append(chunk_1d)   # keep trailing silence
+                    recorded_chunks.append(chunk_1d)   # include trailing silence
                     if silent_count >= SILENCE_CHUNKS:
                         break
-                # Before any speech starts, keep listening (don't accumulate silence)
+                # Before any speech, keep listening (don't accumulate silence)
 
         if quit_event.is_set():
             break
@@ -222,7 +238,6 @@ def capture_thread(vad_model) -> None:
             print("[Thread A] No speech in window — resuming.")
             continue
 
-        # Noise gate — discard very short captures (fan noise, HVAC blips)
         if speech_chunk_count < MIN_SPEECH_CHUNKS:
             print(
                 f"[Thread A] Too short ({speech_chunk_count} speech chunks) — "
@@ -240,7 +255,7 @@ def capture_thread(vad_model) -> None:
 
         audio_queue.put(audio)   # blocks if Thread B is still busy
 
-    # Send poison pill to unblock Thread B
+    # Poison pill to unblock Thread B
     try:
         audio_queue.put_nowait(None)
     except queue.Full:
@@ -273,14 +288,12 @@ def inference_thread(stt_model, lm_model, tokenizer) -> None:
         print("[Thread B] Transcribing...")
         t_stt_start = time.perf_counter()
         result = stt_model.transcribe(
-            audio_np,
-            language="en",
-            fp16=(DEVICE == "cuda"),
+            audio_np, language="en", fp16=(DEVICE == "cuda"),
         )
         text  = result["text"].strip()
         t_stt = time.perf_counter() - t_stt_start
 
-        del audio_np   # free CPU RAM before LLM allocation
+        del audio_np
 
         print(f"[Thread B] You said: {text}")
 
@@ -288,10 +301,9 @@ def inference_thread(stt_model, lm_model, tokenizer) -> None:
             print("[Thread B] Empty transcription — resuming.")
             continue
 
-        # Whisper sometimes returns internal special tokens (e.g. <|af|>)
-        # on noisy clips. These are never valid user input; discard them.
+        # Discard Whisper hallucinations (internal special tokens on noisy clips)
         if "<|" in text:
-            print("[Thread B] Hallucination filtered (special tokens) — resuming.")
+            print("[Thread B] Hallucination filtered — resuming.")
             continue
 
         # Quit commands
@@ -312,7 +324,7 @@ def inference_thread(stt_model, lm_model, tokenizer) -> None:
 
         print(f"[Timing - Thread B] STT: {t_stt:.2f}s | LLM: {t_lm:.2f}s")
 
-        tts_queue.put(reply)   # blocks if Thread C is still speaking
+        tts_queue.put(reply)
 
 
 # ─────────────────────  Thread C — Output ───────────────────────
@@ -330,7 +342,7 @@ def output_thread(tts_engine) -> None:
 
         # ──────────────────────── TTS ───────────────────────────
         print(f"Bot: {text}")
-        tts_text    = _sanitize_for_tts(text)   # expand digits → words
+        tts_text    = _sanitize_for_tts(text)
         t_tts_start = time.perf_counter()
         wav         = tts_engine.tts(tts_text, language="en", speaker="female-en-5")
         t_tts       = time.perf_counter() - t_tts_start
@@ -341,12 +353,11 @@ def output_thread(tts_engine) -> None:
         sample_rate = tts_engine.synthesizer.output_sample_rate
         play_secs   = len(wav_array) / sample_rate
 
-        stop_speaking_event.clear()   # reset before each new utterance
-        playback_active.set()         # tell Thread A to mute mic capture
+        stop_speaking_event.clear()
+        playback_active.set()
         try:
             sd.play(wav_array, samplerate=sample_rate)
-            # Poll every 50 ms instead of blocking sd.wait() so that both
-            # Ctrl+C (quit_event) and Space (stop_speaking_event) respond fast.
+            # Poll every 50 ms so Space and Ctrl+C respond immediately
             t_play_start = time.perf_counter()
             interrupted  = False
             while time.perf_counter() - t_play_start < play_secs:
@@ -356,41 +367,43 @@ def output_thread(tts_engine) -> None:
                     break
                 time.sleep(0.05)
             if not interrupted:
-                time.sleep(0.3)   # brief settling — absorbs mic tail ringing
+                time.sleep(0.3)     # absorbs mic tail ringing
         finally:
             playback_active.clear()
 
-        del wav, wav_array   # free ~1–4 MB CPU RAM before next synthesis
+        del wav, wav_array
 
 
 # ─────────────────────  Thread D — Keyboard ─────────────────────
 
 def keyboard_thread() -> None:
-    """
-    Poll for keypresses using Windows msvcrt (no pip install required).
-    Space  — stop current bot speech and resume listening.
-    q / Q  — graceful full shutdown (same as saying 'quit').
-    """
+    """Poll for keypresses. Space stops speech; q quits."""
+    if os.name != "nt":
+        _tty_raw_on()
+
     print("[Thread D] Keyboard ready   Space: stop speech | q: quit")
 
-    while not quit_event.is_set():
-        if msvcrt.kbhit():
-            key = msvcrt.getwch()
-            if key == " ":
-                print("\n[Thread D] Space pressed — stopping speech.")
-                stop_speaking_event.set()
-            elif key in ("q", "Q"):
-                print("\n[Thread D] Q pressed — quitting.")
-                quit_event.set()
-                stop_speaking_event.set()
-                # Push sentinels so blocked workers unblock immediately
-                for q in (audio_queue, tts_queue):
-                    try:
-                        q.put_nowait(None)
-                    except queue.Full:
-                        pass
-                break
-        time.sleep(0.05)
+    try:
+        while not quit_event.is_set():
+            if _kbhit():
+                key = _getch()
+                if key == " ":
+                    print("\n[Thread D] Space pressed — stopping speech.")
+                    stop_speaking_event.set()
+                elif key in ("q", "Q"):
+                    print("\n[Thread D] Q pressed — quitting.")
+                    quit_event.set()
+                    stop_speaking_event.set()
+                    for q in (audio_queue, tts_queue):
+                        try:
+                            q.put_nowait(None)
+                        except queue.Full:
+                            pass
+                    break
+            time.sleep(0.05)
+    finally:
+        if os.name != "nt":
+            _tty_raw_off()
 
     print("[Thread D] Exiting.")
 
@@ -401,8 +414,7 @@ def _sanitize_for_tts(text: str) -> str:
     """
     Expand digit sequences to spoken words before passing text to Coqui TTS.
     The your_tts phoneme vocabulary has no digit characters; leaving them in
-    causes silent drops and "Character 'X' not found" warnings.
-    Handles integers 0 – 999 999 (years, ages, simple maths, dates).
+    causes silent drops and 'Character X not found' warnings.
     """
     def _int_to_words(n: int) -> str:
         if n < 0:
@@ -439,7 +451,7 @@ def _build_chat_input(tokenizer, history: List[str], user_input: str):
     Build tokenizer input from alternating [user, bot, user, bot, …] history.
     Prefers tokenizer.apply_chat_template (Qwen's native helper).
     """
-    messages = []
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for i, msg in enumerate(history):
         role = "user" if i % 2 == 0 else "assistant"
         messages.append({"role": role, "content": msg})
@@ -456,9 +468,8 @@ def _build_chat_input(tokenizer, history: List[str], user_input: str):
     except Exception as e:
         print(f"[Chat template] Falling back to manual format: {e}")
 
-    system = "You are a helpful assistant. Answer conversationally and concisely."
-    parts  = [f"SYSTEM: {system}", ""]
-    for m in messages:
+    parts = [f"SYSTEM: {SYSTEM_PROMPT}", ""]
+    for m in messages[1:]:
         parts.append(f"{m['role'].upper()}: {m['content'].strip()}")
     parts.append("ASSISTANT:")
     return "\n".join(parts)
@@ -466,12 +477,8 @@ def _build_chat_input(tokenizer, history: List[str], user_input: str):
 
 # ─────────────────────  LM Response ─────────────────────────────
 
-def _generate_reply(
-    user_input: str,
-    chat_history: List[str],
-    lm,
-    tokenizer,
-) -> str:
+def _generate_reply(user_input: str, chat_history: List[str],
+                    lm, tokenizer) -> str:
     """Run Qwen inference and append the (user, reply) pair to chat_history."""
     prompt_text = _build_chat_input(tokenizer, chat_history, user_input)
 
@@ -493,11 +500,10 @@ def _generate_reply(
 
     input_len = inputs["input_ids"].shape[1]
     try:
-        response = tokenizer.decode(
-            output[0][input_len:], skip_special_tokens=True
-        ).strip()
+        response = tokenizer.decode(output[0][input_len:],
+                                    skip_special_tokens=True).strip()
     except Exception:
-        full     = tokenizer.decode(output[0], skip_special_tokens=True)
+        full = tokenizer.decode(output[0], skip_special_tokens=True)
         response = full
         if isinstance(full, str) and full.startswith(prompt_text.strip()):
             response = full[len(prompt_text.strip()):].strip()
@@ -516,33 +522,17 @@ def main() -> None:
     vad_model, stt_model, lm_model, tokenizer, tts_engine = load_all_models()
 
     print("\nVoice chatbot ready (Phase 3 — Multithreaded)")
-    print("Say 'quit', 'exit', or 'stop' to end  |  Space: stop speech  |  q: quit")
-    print()
+    print("Say 'quit', 'exit', or 'stop' to end  |  Space: stop speech  |  q: quit\n")
 
     threads = [
-        threading.Thread(
-            target=capture_thread,
-            args=(vad_model,),
-            name="Thread-A-Capture",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=inference_thread,
-            args=(stt_model, lm_model, tokenizer),
-            name="Thread-B-Inference",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=output_thread,
-            args=(tts_engine,),
-            name="Thread-C-Output",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=keyboard_thread,
-            name="Thread-D-Keyboard",
-            daemon=True,
-        ),
+        threading.Thread(target=capture_thread,   args=(vad_model,),
+                         name="Thread-A-Capture",   daemon=True),
+        threading.Thread(target=inference_thread, args=(stt_model, lm_model, tokenizer),
+                         name="Thread-B-Inference", daemon=True),
+        threading.Thread(target=output_thread,    args=(tts_engine,),
+                         name="Thread-C-Output",    daemon=True),
+        threading.Thread(target=keyboard_thread,
+                         name="Thread-D-Keyboard",  daemon=True),
     ]
 
     for t in threads:
@@ -560,6 +550,12 @@ def main() -> None:
                 q.put_nowait(None)
             except queue.Full:
                 pass
+
+    if os.name != "nt":
+        try:
+            _tty_raw_off()
+        except Exception:
+            pass
 
     print("[Main] All threads done. Exiting.")
 
