@@ -4,6 +4,8 @@
 
 This repository contains the implementation of a fully local, edge-deployed conversational AI pipeline. The system integrates Speech-to-Text (STT), a Large Language Model (LLM), and Text-to-Speech (TTS) to create a low-latency voice assistant capable of running on consumer-grade hardware (tested on an NVIDIA RTX 3060 6GB).
 
+This research has been done in conjunction with the Human–AI Interaction and Innovation Nexus at Vaasa.
+
 ## Repository Contents
 
 | Script | Phase | Description |
