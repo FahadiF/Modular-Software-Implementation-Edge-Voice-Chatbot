@@ -1,4 +1,4 @@
-# Modular Edge Voice Chatbot
+# Modular-Software-Implementation-Edge-Voice-Chatbot
 
 **Master's Thesis Project - University of Vaasa**
 
