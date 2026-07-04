@@ -1,3 +1,27 @@
+> ## Project Status
+>
+> This repository contains the original implementation developed as part of my Master's thesis at the University of Vaasa.
+>
+> Active development now continues in the successor project:
+>
+> **➡️ Edge Voice Assistant**
+>
+> https://github.com/FahadiF/Edge-Voice-Assistant
+>
+> Edge Voice Assistant builds upon the ideas explored in this research while introducing a redesigned architecture aimed at production-quality offline voice interaction, with:
+>
+> - Streaming voice interaction
+> - True voice interruption (barge-in)
+> - Modular architecture
+> - Modern model management
+> - Improved developer experience
+> - Desktop and web interfaces
+> - Production-quality engineering
+>
+> This repository is preserved as the research reference implementation accompanying the Master's thesis. Keeping the repositories separate preserves the exact implementation evaluated in the thesis while allowing the successor project to evolve independently.
+
+---
+
 # Modular-Software-Implementation-Edge-Voice-Chatbot
 
 **Master's Thesis Project - University of Vaasa**
@@ -5,6 +29,13 @@
 This repository contains the implementation of a fully local, edge-deployed conversational AI pipeline. The system integrates Speech-to-Text (STT), a Large Language Model (LLM), and Text-to-Speech (TTS) to create a low-latency voice assistant capable of running on consumer-grade hardware (tested on an NVIDIA RTX 3060 6GB).
 
 This research has been done in conjunction with the Human–AI Interaction and Innovation Nexus at Vaasa.
+
+## Project Evolution
+
+| Period | Milestone |
+|---|---|
+| 2025–2026 | 🎓 **Master's Thesis** — Modular Software Implementation – Edge Voice Chatbot |
+| 2026– | 🚀 **Edge Voice Assistant** — Production-grade offline AI voice assistant |
 
 ## Repository Contents
 
